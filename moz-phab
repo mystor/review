@@ -31,6 +31,7 @@ import sys
 import tempfile
 import time
 import traceback
+import urllib
 import urllib2
 import uuid
 from contextlib import contextmanager
@@ -83,6 +84,15 @@ PHABRICATOR_URLS = {
 }
 
 DEFAULT_UPDATE_MESSAGE = "Revision updated."
+
+# arc global config paths
+if IS_WINDOWS:
+    ARC_GLOBAL_CONFIG_PATHS = [
+        os.path.join(os.getenv("APPDATA", ""), ".arcrc"),
+        os.path.join(os.getenv("ProgramData", ""), "Phabricator", "Arcanist", "config"),
+    ]
+else:
+    ARC_GLOBAL_CONFIG_PATHS = ["/etc/arcconfig", os.path.expanduser("~/.arcrc")]
 
 # arc related consts.
 ARC_COMMIT_DESC_TEMPLATE = """
@@ -542,18 +552,9 @@ class Repository(object):
             os.path.join(self.dot_path, ".arcconfig"),
             os.path.join(self.path, ".arcconfig"),
         ]
-        if IS_WINDOWS:
-            defaults_files = [
-                os.path.join(os.getenv("APPDATA", ""), ".arcrc"),
-                os.path.join(
-                    os.getenv("ProgramData", ""), "Phabricator", "Arcanist", "config"
-                ),
-            ]
-        else:
-            defaults_files = ["/etc/arcconfig", os.path.expanduser("~/.arcrc")]
         phab_url = read_json_field(
             arcconfig_files, ["phabricator.uri"]
-        ) or read_json_field(defaults_files, ["config", "default"])
+        ) or read_json_field(ARC_GLOBAL_CONFIG_PATHS, ["config", "default"])
 
         if not phab_url:
             raise Error("Failed to determine Phabricator URL (missing .arcconfig?)")
@@ -2087,78 +2088,75 @@ def check_for_invalid_reviewers(reviewers, cwd):
 #
 
 
-def arc_out(args, cwd, stdin=None, log_output_to_console=True):
-    """arc wrapper that logs output to the console.
+def conduit_auth(cwd):
+    """Get the conduit API auth information to contact phabricator.
 
     Args:
-        args: A list of arguments for the arc command.
-        cwd: The directory to run the arc command in.
-        stdin: Optionally overrides the standard input pipe to use for the arc
-            subprocess call.
-        log_output_to_console: Defaults to True.  If set to False, don't log the arc
-            standard output to the console (stderr prints to console as normal).
+        cwd: The directory to pull phabricator configuration from.
 
     Returns:
-        The list of lines arc printed to the console.
+        (conduit_auth, conduit_url)
     """
-    arc_output = check_output(config.arc + args, cwd=cwd, split=False, stdin=stdin)
-    if logger.level != logging.DEBUG and log_output_to_console:
-        logger.info(arc_output)
-    return arc_output
+
+    # FIXME: Using probe_repo here to discover phab_url might be inefficient
+    repo = probe_repo(cwd)
+    if not repo:
+        raise Error("Unable to discover repository")
+    conduit_url = repo.phab_url.rstrip("/") + "/api/"
+
+    # Example .arcrc config file
+    # $ cat ~/.arcrc | jq .
+    #
+    # {
+    #   "hosts": {
+    #     "https://phabricator.services.mozilla.com/api/": {
+    #       "token": "cli-XXXXXXXXXXXXXXXXXXXXXXXXXXXX"
+    #     }
+    #   }
+    # }
+    auth = read_json_field(ARC_GLOBAL_CONFIG_PATHS, ["hosts", conduit_url])
+    if not auth:
+        # FIXME: prompt user for token from "{repo.phab_url}/conduit/login" & save
+        raise Error("No conduit authentication info found")
+
+    return auth, conduit_url
 
 
 def arc_call_conduit(api_method, api_call_args, cwd):
-    """Run 'arc call-conduit' and return the JSON API call result.
+    """Call a conduit API, and return the JSON API call result.
 
     Args:
         api_method: The API method name to call, like 'differential.revision.edit'.
         api_call_args: JSON dict of call args to send.
-        cwd: The directory to run the arc command in.
+        cwd: The directory to pull phabricator configuration from.
 
     Raises:
         ConduitAPIError if the API threw an error back at us.
     """
-    arc_args = ["call-conduit", api_method]
-    # 'arc call-conduit' only accepts its args from STDIN.
-    with temporary_file(json.dumps(api_call_args)) as args_file:
-        logger.debug("Arc stdin: %s", api_call_args)
-        with open(args_file, "rb") as temp_f:
-            output = arc_out(
-                arc_args, cwd=cwd, stdin=temp_f, log_output_to_console=False
-            )
 
-    # We expect arc output to be a JSON. However, in DEBUG mode, a `--trace` is used and
-    # the reponse becomes a multiline string with some messages in plain text.
-    output = "\n".join([line for line in output.splitlines() if line.startswith("{")])
-    maybe_error = parse_api_error(output)
-    if maybe_error:
-        raise ConduitAPIError(maybe_error)
+    auth, conduit_url = conduit_auth(cwd)
 
-    return json.loads(output)["response"]
+    api_call_args = dict(api_call_args, __conduit__=auth)
+    body = urllib.urlencode({"params": json.dumps(api_call_args), "output": "json"})
 
+    try:
+        response = json.load(urllib2.urlopen(conduit_url + api_method, body=body))
+    except (urllib2.HTTPError, urllib2.URLError) as e:
+        raise Error("Failed to contact phabricator: %s" % e)
+    except ValueError:
+        raise Error("Malformed response from phabricator")
 
-def parse_api_error(api_response):
-    """Parse the string output from 'arc call-conduit' and return any errors found.
-
-    Args:
-        api_response: stdout string captured from 'arc call-conduit'.  It should
-            contain only valid JSON.
-
-    Returns:
-        A string error description if an error occurred or None if no error occurred.
-    """
-    # Example error response from running
-    # $ echo '{}' | arc call-conduit differential.revision.edit | jq .
+    # Example error response from remote API
     #
     # {
-    #   "error": "ERR-CONDUIT-CORE",
-    #   "errorMessage": "ERR-CONDUIT-CORE: Parameter \"transactions\" is not a list "\
-    #       "of transactions.",
-    #   "response": null
+    #   "error_code": "ERR-CONDUIT-CORE",
+    #   "error_info": "Parameter \"transactions\" is not a list of transactions.",
+    #   "result": null
     # }
-    response = json.loads(api_response)
-    if response["error"] and response["errorMessage"]:
-        return response["errorMessage"]
+    if response["error_code"]:
+        raise ConduitAPIError("%s: %s" % (response["error_code"], response.get("error_info", "No error_info")))
+
+    return response["result"]
 
 
 def arc_ping(cwd):
@@ -2171,7 +2169,7 @@ def arc_ping(cwd):
     except ConduitAPIError as err:
         logger.error(err)
         return False
-    except CommandError:
+    except Error:
         return False
     return True
 

@@ -213,32 +213,24 @@ class Helpers(unittest.TestCase):
         m_which.assert_called_once_with(path)
 
 
-@mock.patch("mozphab.arc_out")
-def test_valid_reviewers_in_phabricator_returns_no_errors(arc_out):
+@mock.patch("mozphab.arc_call_conduit")
+def test_valid_reviewers_in_phabricator_returns_no_errors(arc_call_conduit):
     # See https://phabricator.services.mozilla.com/api/user.search
-    arc_out.side_effect = (
+    arc_call_conduit.side_effect = (
         # user.query
-        json.dumps(
-            {"error": None, "errorMessage": None, "response": [{"userName": "alice"}]}
-        ),
+        [{"userName": "alice"}],
         # project.search
-        json.dumps(
-            {
-                "error": None,
-                "errorMessage": None,
-                "response": {
-                    "data": [{"fields": {"slug": "user-group"}}],
-                    "maps": {"slugMap": {"alias1": {}, "#alias2": {}}},
-                },
-            }
-        ),
+        {
+            "data": [{"fields": {"slug": "user-group"}}],
+            "maps": {"slugMap": {"alias1": {}, "#alias2": {}}},
+        },
     )
     reviewers = dict(granted=[], request=["alice", "#user-group", "#alias1", "#alias2"])
     assert [] == mozphab.check_for_invalid_reviewers(reviewers, "")
 
 
-@mock.patch("mozphab.arc_out")
-def test_non_existent_reviewers_or_groups_generates_error_list(arc_out):
+@mock.patch("mozphab.arc_call_conduit")
+def test_non_existent_reviewers_or_groups_generates_error_list(arc_call_conduit):
     ts = 1543622400
     ts_str = datetime.datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M")
     reviewers = dict(
@@ -252,28 +244,14 @@ def test_non_existent_reviewers_or_groups_generates_error_list(arc_out):
             "#gon-group",
         ],
     )
-    arc_out.side_effect = (
+    arc_call_conduit.side_effect = (
         # user.query
-        json.dumps(
-            {
-                "error": None,
-                "errorMessage": None,
-                "response": [
-                    dict(userName="alice"),
-                    dict(
-                        userName="goober", currentStatus="away", currentStatusUntil=ts
-                    ),
-                ],
-            }
-        ),
+        [
+            dict(userName="alice"),
+            dict(userName="goober", currentStatus="away", currentStatusUntil=ts),
+        ],
         # project.search
-        json.dumps(
-            {
-                "error": None,
-                "errorMessage": None,
-                "response": {"data": [{"fields": {"slug": "user-group"}}]},
-            }
-        ),
+        {"data": [{"fields": {"slug": "user-group"}}]},
     )
     expected_errors = [
         dict(name="goober", until=ts_str),
@@ -284,64 +262,19 @@ def test_non_existent_reviewers_or_groups_generates_error_list(arc_out):
     assert expected_errors == mozphab.check_for_invalid_reviewers(reviewers, "")
 
 
-@mock.patch("mozphab.arc_out")
-def test_reviwer_case_sensitivity(arc_out):
+@mock.patch("mozphab.arc_call_conduit")
+def test_reviwer_case_sensitivity(arc_call_conduit):
     reviewers = dict(granted=[], request=["Alice", "#uSeR-gRoUp"])
-    arc_out.side_effect = (
+    arc_call_conduit.side_effect = (
         # See https://phabricator.services.mozilla.com/conduit/method/user.query/
-        json.dumps(
-            {"error": None, "errorMessage": None, "response": [dict(userName="alice")]}
-        ),
+        [dict(userName="alice")],
         # See https://phabricator.services.mozilla.com/conduit/method/project.search/
-        json.dumps(
-            {
-                "error": None,
-                "errorMessage": None,
-                "response": {"data": [{"fields": {"slug": "user-group"}}]},
-            }
-        ),
+        {"data": [{"fields": {"slug": "user-group"}}]},
     )
     assert [] == mozphab.check_for_invalid_reviewers(reviewers, "")
 
 
-@mock.patch("mozphab.arc_out")
-def test_api_call_with_no_errors_returns_api_response_json(arc_out):
-    # fmt: off
-    arc_out.return_value = json.dumps(
-        {
-            "error": None,
-            "errorMessage": None,
-            "response": {"data": "ok"}
-        }
-    )
-    # fmt: on
-    api_response = mozphab.arc_call_conduit("my.method", {}, "")
-
-    assert api_response == {"data": "ok"}
-    arc_out.assert_called_once_with(
-        ["call-conduit", "my.method"],
-        cwd="",
-        log_output_to_console=False,
-        stdin=mock.ANY,
-    )
-
-
-@mock.patch("mozphab.arc_out")
-def test_api_call_with_error_raises_exception(arc_out):
-    arc_out.return_value = json.dumps(
-        {
-            "error": "ERR-CONDUIT-CORE",
-            "errorMessage": "**sad trombone**",
-            "response": None,
-        }
-    )
-
-    with pytest.raises(mozphab.ConduitAPIError) as err:
-        mozphab.arc_call_conduit("my.method", {}, "")
-        assert err.message == "**sad trombone**"
-
-
-@mock.patch("mozphab.arc_out")
-def test_arc_ping_with_invalid_certificate_returns_false(arc_out):
-    arc_out.side_effect = mozphab.CommandError
+@mock.patch("mozphab.arc_call_conduit")
+def test_arc_ping_with_invalid_certificate_returns_false(arc_call_conduit):
+    arc_call_conduit.side_effect = mozphab.Error
     assert not mozphab.arc_ping("")

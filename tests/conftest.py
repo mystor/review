@@ -8,6 +8,9 @@ import os
 import pytest
 import subprocess
 import sys
+import collections
+import urlparse
+import urllib2
 
 mozphab = imp.load_source(
     "mozphab", os.path.join(os.path.dirname(__file__), os.path.pardir, "moz-phab")
@@ -121,6 +124,47 @@ def safe_environ(monkeypatch):
 
 
 @pytest.fixture
+@mock.patch("mozphab.conduit_auth")
+@mock.patch("urllib2.urlopen")
+def conduit(m_conduit_auth, m_urlopen):
+    """Helper for mocking out calls to conduit APIs"""
+
+    # shim conduit auth
+    auth = {"token": "cli-XXXXXXXXXXXXXXXXXXXXXXXXXXXX"}
+    api_url = "https://phabricator-dev.allizom.org/api/"
+    m_conduit_auth.return_value = (auth, api_url)
+
+    # shim urlopen
+    handlers = collections.defaultdict(mock.Mock)
+    def urlopen(url, body):
+        # Get command from URL
+        cmd = url[len(api_url):]
+        if not url.startswith(api_url):
+            raise urllib2.URLError("Unknown URL")
+
+        # Handle the request
+        params = json.loads(urlparse.parse_qs(body)["params"])
+        if params.get("__conduit__") != auth:
+            reply = {
+                "result": None,
+                "error_code": "ERR-INVALID-AUTH",
+                "error_info": "Authentication token is not valid",
+            }
+        elif cmd not in handlers:
+            reply = {
+                "result": None,
+                "error_code": "ERR-CONDUIT-CALL",
+                "error_info": "Conduit API method \"%s\" does not exist." % cmd,
+            }
+        else:
+            reply = handlers[cmd](params)
+        return BytesIO(json.dumps(reply))
+    m_urlopen.side_effect = urlopen
+
+    return handlers
+
+
+@pytest.fixture
 def in_process(monkeypatch, safe_environ, request):
     """Set up an environment to run moz-phab within the current process."""
     # Make sure other tests didn't leak and mess up the module-level
@@ -142,18 +186,16 @@ def in_process(monkeypatch, safe_environ, request):
     monkeypatch.setattr(sys, "exit", reraise)
 
     # Disable uploading a new commit title and summary to Phabricator.  This operation
-    # is safe to skip and doing so makes it easier to test other arc_out call sites.
+    # is safe to skip and doing so makes it easier to test other arc_call_conduit call sites.
     monkeypatch.setattr(mozphab, "update_phabricator_commit_summary", mock.MagicMock())
 
     def arc_ping(self, *args):
         return True
 
-    def arc_out(self, *args, **kwargs):
+    def arc_call_conduit(self, *args, **kwargs):
         # Return alice as the only valid reviewer name from Phabricator.
         # See https://phabricator.services.mozilla.com/api/user.search
-        return json.dumps(
-            {"error": None, "errorMessage": None, "response": [{"userName": "alice"}]}
-        )
+        return [{"userName": "alice"}]
 
     def check_call_by_line_static(*args, **kwargs):
         return ["Revision URI: http://example.test/D123"]
@@ -164,5 +206,5 @@ def in_process(monkeypatch, safe_environ, request):
     )
 
     monkeypatch.setattr(mozphab, "arc_ping", arc_ping)
-    monkeypatch.setattr(mozphab, "arc_out", arc_out)
+    monkeypatch.setattr(mozphab, "arc_call_conduit", arc_call_conduit)
     monkeypatch.setattr(mozphab, "check_call_by_line", check_call_by_line)
